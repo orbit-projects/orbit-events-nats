@@ -28,6 +28,7 @@ from uuid import UUID, uuid4
 import nats
 from nats.js.api import AckPolicy, ConsumerConfig
 from orbit.events import Event, EventHandler, EventTransport
+from orbit_events import decode_event, encode_cloudevent
 
 from orbit_events_nats.config import NatsConfig
 
@@ -154,6 +155,7 @@ class NatsEventTransport(EventTransport):
         self._connection_lock = asyncio.Lock()
         self._publish_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._subscriptions: dict[UUID, _OwnedSubscription] = {}
         self._event_tokens: dict[str, UUID] = {}
         self._failed: set[UUID] = set()
@@ -216,6 +218,10 @@ class NatsEventTransport(EventTransport):
                 raise NatsTransportError("connect")
             return self._jetstream
 
+    async def check_connection(self) -> None:
+        """Establish the configured NATS connection without publishing an event."""
+        await self._ensure_jetstream()
+
     async def publish(self, event: Event[Any]) -> None:
         """Publish a bounded JSON event and wait for JetStream's storage acknowledgement."""
         if not isinstance(event, Event):
@@ -223,9 +229,7 @@ class NatsEventTransport(EventTransport):
         if self._closed:
             raise NatsTransportError("publish")
         subject = self.subject_for(event.name)
-        payload = event.model_dump_json().encode("utf-8")
-        if len(payload) > self.config.max_message_bytes:
-            raise ValueError("Encoded event exceeds NatsConfig.max_message_bytes.")
+        payload = encode_cloudevent(event, max_bytes=self.config.max_message_bytes)
         jetstream = await self._ensure_jetstream()
         async with self._publish_lock:
             if self._closed:
@@ -235,7 +239,10 @@ class NatsEventTransport(EventTransport):
                     subject,
                     payload,
                     timeout=self.config.publish_timeout_seconds,
-                    headers={"Nats-Msg-Id": str(event.id)},
+                    headers={
+                        "Nats-Msg-Id": str(event.id),
+                        "Content-Type": "application/cloudevents+json",
+                    },
                 )
             except asyncio.CancelledError:
                 raise
@@ -294,14 +301,24 @@ class NatsEventTransport(EventTransport):
     ) -> None:
         """Validate one JetStream event and ack, nak, or terminate by delivery count."""
         try:
-            event = Event[Any].model_validate_json(message.data)
+            event = decode_event(message.data, max_bytes=self.config.max_message_bytes)
             if event.name != event_name:
                 raise ValueError("Event envelope name does not match its NATS subject.")
         except Exception as exc:
             self._failed.add(token)
             _LOG.error("NATS consumer terminated invalid event (%s)", type(exc).__name__)
-            with suppress(Exception):
-                await message.term()
+            if self.config.dead_letter_enabled:
+                published = await self._publish_dead_letter(
+                    event_name, message, exc, "application/octet-stream"
+                )
+                if published:
+                    await message.term()
+                else:
+                    with suppress(Exception):
+                        await message.nak(delay=self.config.retry_backoff_seconds)
+            else:
+                with suppress(Exception):
+                    await message.term()
             return
 
         try:
@@ -314,32 +331,82 @@ class NatsEventTransport(EventTransport):
             if delivered >= self.config.max_deliver:
                 self._failed.add(token)
                 _LOG.error("NATS handler terminated after max delivery (%s)", type(exc).__name__)
-                with suppress(Exception):
-                    await message.term()
+                if self.config.dead_letter_enabled:
+                    if await self._publish_dead_letter(
+                        event_name, message, exc, "application/cloudevents+json"
+                    ):
+                        await message.term()
+                    else:
+                        with suppress(Exception):
+                            await message.nak(delay=self.config.retry_backoff_seconds)
+                else:
+                    with suppress(Exception):
+                        await message.term()
                 return
             with suppress(Exception):
                 await message.nak(delay=self.config.retry_backoff_seconds)
+
+    async def _publish_dead_letter(
+        self, event_name: str, message: _Message, error: Exception, content_type: str
+    ) -> bool:
+        """Persist an unchanged failed payload before allowing its source to be terminated."""
+        try:
+            jetstream = await self._ensure_jetstream()
+            headers = {
+                "Content-Type": content_type,
+                "Orbit-Dead-Letter-Source-Subject": self.subject_for(event_name),
+                "Orbit-Dead-Letter-Event-Name": event_name,
+                "Orbit-Dead-Letter-Reason": type(error).__name__[:64],
+                "Orbit-Dead-Letter-Deliveries": str(message.metadata.num_delivered),
+            }
+            sequence = getattr(getattr(message.metadata, "sequence", None), "stream", None)
+            if isinstance(sequence, int) and sequence > 0:
+                headers["Nats-Msg-Id"] = f"orbit-dlq:{self.config.stream}:{sequence}"
+            async with self._publish_lock:
+                if self._closed:
+                    raise RuntimeError("transport is closed")
+                await jetstream.publish(
+                    f"{self.config.subject_prefix}.dead-letter.{event_name}",
+                    message.data,
+                    timeout=self.config.publish_timeout_seconds,
+                    headers=headers,
+                )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.error("NATS dead-letter publish failed (%s)", type(exc).__name__)
+            return False
 
     async def unsubscribe(self, token: object) -> None:
         """Unsubscribe one local durable consumer without deleting its server-side durable state."""
         if not isinstance(token, UUID):
             raise TypeError("NATS subscription token must be a UUID.")
-        async with self._state_lock:
-            owned = self._subscriptions.pop(token, None)
-            if owned is None:
-                raise ValueError("Unknown NATS subscription token.")
-            self._event_tokens.pop(owned.event_name, None)
-        try:
-            await owned.subscription.unsubscribe()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise NatsTransportError("unsubscribe") from None
+        async with self._close_lock:
+            async with self._state_lock:
+                if self._closed:
+                    raise NatsTransportError("unsubscribe")
+                owned = self._subscriptions.get(token)
+                if owned is None:
+                    raise ValueError("Unknown NATS subscription token.")
+            try:
+                await owned.subscription.unsubscribe()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise NatsTransportError("unsubscribe") from None
+            async with self._state_lock:
+                if self._subscriptions.get(token) is owned:
+                    self._subscriptions.pop(token, None)
+                    self._event_tokens.pop(owned.event_name, None)
 
     async def close(self) -> None:
         """Unsubscribe and drain one shared cleanup before propagating cancellation."""
         task = self._close_task
-        if task is None:
+        retry_failed_close = (
+            task is not None and task.done() and (task.cancelled() or task.exception() is not None)
+        )
+        if task is None or retry_failed_close:
             self._closed = True
             task = asyncio.create_task(self._finish_close())
             self._close_task = task
@@ -356,24 +423,51 @@ class NatsEventTransport(EventTransport):
             raise asyncio.CancelledError
 
     async def _finish_close(self) -> None:
-        """Unsubscribe every local consumer and drain the owned connection."""
-        async with self._state_lock:
-            subscriptions = tuple(self._subscriptions.values())
-            self._subscriptions.clear()
-            self._event_tokens.clear()
-        for owned in subscriptions:
-            with suppress(Exception):
-                await owned.subscription.unsubscribe()
-        async with self._publish_lock:
-            client, self._client = self._client, None
-            self._jetstream = None
-            if client is not None:
+        """Retain failed consumer and connection cleanup for a later close attempt."""
+        async with self._close_lock:
+            async with self._state_lock:
+                subscriptions = tuple(self._subscriptions.items())
+            failures = 0
+            for token, owned in subscriptions:
                 try:
-                    await client.drain()
+                    await owned.subscription.unsubscribe()
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    with suppress(Exception):
-                        await client.close()
-                    raise NatsTransportError("close") from None
+                    failures += 1
+                else:
+                    async with self._state_lock:
+                        if self._subscriptions.get(token) is owned:
+                            self._subscriptions.pop(token, None)
+                            self._event_tokens.pop(owned.event_name, None)
+            async with self._publish_lock:
+                client = self._client
+                if client is not None:
+                    try:
+                        await client.drain()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        try:
+                            await client.close()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            failures += 1
+                        else:
+                            self._client = None
+                            self._jetstream = None
+                            async with self._state_lock:
+                                self._subscriptions.clear()
+                                self._event_tokens.clear()
+                    else:
+                        self._client = None
+                        self._jetstream = None
+                        async with self._state_lock:
+                            self._subscriptions.clear()
+                            self._event_tokens.clear()
+            if failures:
+                raise NatsTransportError("close") from None
 
 
 __all__ = ["NatsEventTransport", "NatsTransportError"]

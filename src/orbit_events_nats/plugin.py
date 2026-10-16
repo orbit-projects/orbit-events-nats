@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns the NATS JetStream transport."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 
 from orbit_events_nats.transport import NatsEventTransport
 
@@ -35,6 +37,14 @@ class NatsTransportPlugin(Plugin):
         if not isinstance(transport, NatsEventTransport):
             raise TypeError("NatsTransportPlugin requires a NatsEventTransport instance.")
         self.transport = transport
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check NATS connection",
+                description="Establish the configured JetStream connection without publishing.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the transport through its stable optional-package dependency key."""
@@ -45,6 +55,11 @@ class NatsTransportPlugin(Plugin):
     async def deactivate(self) -> None:
         """Drain NATS subscriptions and close the client on shutdown or rollback."""
         await self.transport.close()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Connect to JetStream and retain the client for normal plugin cleanup."""
+        await self.transport.check_connection()
+        return ControlResult("NATS JetStream connection is established.")
 
 
 __all__ = ["NATS_EVENT_TRANSPORT_KEY", "NatsTransportPlugin"]

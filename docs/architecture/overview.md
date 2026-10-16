@@ -43,11 +43,17 @@ Subjects map to `<subject_prefix>.<event_name>`. Each event subscription gets a 
 named from `durable_prefix` and the event name. A handler success is acknowledged synchronously; a
 handler failure is negatively acknowledged with bounded redelivery delay until the configured
 `max_deliver`, after which the message is terminated and the subscription ID is reported in
-`failed_subscriptions`. Terminated messages are not automatically copied to a dead-letter stream.
-JetStream stream retention, replication, storage, consumer policies, and server authentication are
-operator-owned. Delivery is at-least-once; handlers should be idempotent. Publish message IDs use the
-Core event ID, but duplicate suppression depends on JetStream's configured duplicate window and is
-not an exactly-once claim.
+`failed_subscriptions`. Optional dead-lettering uses
+`NatsConfig(dead_letter_enabled=True)` and publishes unchanged payload bytes to
+`<subject_prefix>.dead-letter.<event_name>`. JetStream acknowledgement precedes source termination;
+a failed DLQ publish causes source redelivery. Invalid envelopes are also retained as raw bytes.
+Provision a stream that captures the generated dead-letter subjects. Stream sequence message IDs
+can suppress repeat writes during JetStream's duplicate window; they do not provide exactly-once
+processing.
+
+JetStream retention, replication, storage, consumer policies, access control, and server
+authentication are operator-owned. DLQ payloads may contain sensitive event data and require
+restricted reader access. Delivery remains at-least-once; handlers should be idempotent.
 
 No live NATS server test is claimed; the unit tests use fake client objects.
 

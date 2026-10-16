@@ -46,6 +46,7 @@ class NatsConfig(BaseModel):
     pending_bytes_limit: int = Field(default=67_108_864, ge=65_536, le=1_073_741_824)
     max_message_bytes: int = Field(default=1_048_576, ge=1, le=10_485_760)
     retry_backoff_seconds: float = Field(default=1, gt=0, le=3600)
+    dead_letter_enabled: bool = False
 
     @field_validator("servers")
     @classmethod

@@ -30,6 +30,7 @@ from orbit_events_nats import (
     NATS_EVENT_TRANSPORT_KEY,
     NatsConfig,
     NatsEventTransport,
+    NatsTransportError,
     NatsTransportPlugin,
 )
 
@@ -49,10 +50,12 @@ def make_config(**updates: Any) -> NatsConfig:
 class FakeMessage:
     """Capture JetStream ack, nak, and terminate dispositions."""
 
-    def __init__(self, data: bytes, *, delivered: int = 1) -> None:
+    def __init__(self, data: bytes, *, delivered: int = 1, sequence: int = 1) -> None:
         """Set serialized event bytes and the server-provided delivery count."""
         self.data = data
-        self.metadata = SimpleNamespace(num_delivered=delivered)
+        self.metadata = SimpleNamespace(
+            num_delivered=delivered, sequence=SimpleNamespace(stream=sequence)
+        )
         self.acked = False
         self.nak_delay: float | None = None
         self.terminated = False
@@ -93,11 +96,14 @@ class FakeJetStream:
         self.subscribe_options: dict[str, object] | None = None
         self.callback: Callable[[FakeMessage], Awaitable[None]] | None = None
         self.subscription = FakeSubscription()
+        self.publish_error: Exception | None = None
 
     async def publish(
         self, subject: str, payload: bytes, *, timeout: float, headers: dict[str, str]
     ) -> object:
         """Record a publish that the adapter treats as acknowledged by JetStream."""
+        if self.publish_error is not None:
+            raise self.publish_error
         self.published.append((subject, payload, timeout, headers))
         return object()
 
@@ -188,9 +194,12 @@ async def test_publish_waits_for_jetstream_ack_and_uses_event_id_for_deduplicati
     await transport.publish(event)
     subject, payload, timeout, headers = client.js.published[0]
     assert subject == "orbit.events.orders.created"
-    assert b'"name":"orders.created"' in payload
+    assert b'"specversion":"1.0"' in payload
     assert timeout == 5
-    assert headers == {"Nats-Msg-Id": str(event.id)}
+    assert headers == {
+        "Nats-Msg-Id": str(event.id),
+        "Content-Type": "application/cloudevents+json",
+    }
     await transport.close()
     assert client.drained
 
@@ -259,6 +268,86 @@ async def test_handler_failures_nak_until_delivery_limit_then_terminate() -> Non
 
 
 @pytest.mark.asyncio
+async def test_dead_letter_is_confirmed_before_terminal_source_disposition() -> None:
+    """Opt-in DLQ preserves payload bytes and excludes private exception text."""
+    client, connect = client_factory()
+    transport = NatsEventTransport(
+        make_config(max_deliver=1, dead_letter_enabled=True), connect_factory=connect
+    )
+
+    async def handler(_event: Event[Any]) -> None:
+        raise RuntimeError("private payload token")
+
+    await transport.subscribe("orders.failed", handler)
+    raw = Event(name="orders.failed", payload={"secret": "retained only in payload"})
+    encoded = raw.model_dump_json().encode()
+    message = FakeMessage(encoded)
+    callback = client.js.callback
+    assert callback is not None
+    await callback(message)
+
+    assert message.terminated
+    assert not message.acked
+    subject, payload, _timeout, headers = client.js.published[0]
+    assert subject == "orbit.events.dead-letter.orders.failed"
+    assert payload == encoded
+    assert headers["Orbit-Dead-Letter-Reason"] == "RuntimeError"
+    assert headers["Orbit-Dead-Letter-Deliveries"] == "1"
+    assert headers["Nats-Msg-Id"] == "orbit-dlq:ORBIT_EVENTS:1"
+    assert "private payload token" not in repr(headers)
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_publish_failure_redelivers_original_message() -> None:
+    """A failed DLQ write must leave the original message available for retry."""
+    client, connect = client_factory()
+    transport = NatsEventTransport(
+        make_config(max_deliver=1, dead_letter_enabled=True), connect_factory=connect
+    )
+
+    async def handler(_event: Event[Any]) -> None:
+        raise RuntimeError("private application detail")
+
+    await transport.subscribe("orders.failed", handler)
+    client.js.publish_error = RuntimeError("broker detail")
+    message = FakeMessage(Event(name="orders.failed", payload={}).model_dump_json().encode())
+    callback = client.js.callback
+    assert callback is not None
+    await callback(message)
+
+    assert not message.terminated
+    assert not message.acked
+    assert message.nak_delay == 1
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_event_bytes_are_retained_in_dead_letter_stream() -> None:
+    """Poison bytes that cannot decode are copied unchanged with a binary content type."""
+    client, connect = client_factory()
+    transport = NatsEventTransport(make_config(dead_letter_enabled=True), connect_factory=connect)
+
+    async def handler(_event: Event[Any]) -> None:
+        pytest.fail("invalid payload must not reach the event handler")
+
+    await transport.subscribe("orders.created", handler)
+    raw = b'{"specversion":"broken","private":"data"}'
+    message = FakeMessage(raw)
+    callback = client.js.callback
+    assert callback is not None
+    await callback(message)
+
+    assert message.terminated
+    subject, payload, _timeout, headers = client.js.published[0]
+    assert subject == "orbit.events.dead-letter.orders.created"
+    assert payload == raw
+    assert headers["Content-Type"] == "application/octet-stream"
+    assert headers["Orbit-Dead-Letter-Reason"] == "EventSchemaError"
+    await transport.close()
+
+
+@pytest.mark.asyncio
 async def test_core_plugin_registers_transport_and_drains_client() -> None:
     """Core resolves the optional package key and owns the NATS connection lifecycle."""
     client, connect = client_factory()
@@ -270,6 +359,21 @@ async def test_core_plugin_registers_transport_and_drains_client() -> None:
     await transport.publish(Event(name="orders.created", payload={"order_id": "o-2"}))
     await app.stop()
     assert transport.closed
+    assert client.drained
+
+
+@pytest.mark.asyncio
+async def test_core_plugin_connection_action_connects_without_publishing() -> None:
+    """The CLI check establishes JetStream and leaves lifecycle cleanup with Core."""
+    client, connect = client_factory()
+    plugin = NatsTransportPlugin(NatsEventTransport(make_config(), connect_factory=connect))
+
+    result = await plugin.control_actions[0].handler({})
+
+    assert result is not None
+    assert result.summary == "NATS JetStream connection is established."
+    assert not client.closed and not client.drained
+    await plugin.deactivate()
     assert client.drained
 
 
@@ -306,3 +410,59 @@ async def test_cancelled_close_waits_for_shared_drain_and_can_be_retried() -> No
     await transport.close()
     assert drain_calls == 1
     assert client.drained
+
+
+@pytest.mark.asyncio
+async def test_failed_subscription_and_connection_cleanup_are_retried() -> None:
+    """NATS retains subscriptions and connection handles until cleanup succeeds."""
+    client, connect = client_factory()
+    transport = NatsEventTransport(make_config(), connect_factory=connect)
+
+    async def handler(_event: Event[Any]) -> None:
+        return None
+
+    await transport.subscribe("orders.created", handler)
+    subscription = client.js.subscription
+    unsubscribe_calls = 0
+    drain_calls = 0
+    close_calls = 0
+
+    async def unsubscribe_once() -> None:
+        nonlocal unsubscribe_calls
+        unsubscribe_calls += 1
+        if unsubscribe_calls == 1:
+            raise RuntimeError("temporary unsubscribe failure")
+        subscription.closed = True
+
+    async def drain_once() -> None:
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls == 1:
+            raise RuntimeError("temporary drain failure")
+        client.drained = True
+        client.closed = True
+
+    async def close_once() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("temporary force-close failure")
+        client.closed = True
+
+    subscription.unsubscribe = unsubscribe_once  # type: ignore[method-assign]
+    client.drain = drain_once  # type: ignore[method-assign]
+    client.close = close_once  # type: ignore[method-assign]
+
+    with pytest.raises(NatsTransportError, match="close"):
+        await transport.close()
+    assert not subscription.closed
+    assert not client.closed
+
+    await transport.close()
+    await transport.close()
+    assert unsubscribe_calls == 2
+    assert drain_calls == 2
+    assert close_calls == 1
+    assert subscription.closed
+    assert client.drained
+    assert client.closed

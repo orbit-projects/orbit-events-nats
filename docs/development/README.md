@@ -19,3 +19,8 @@ Optional SDKs and live-service tests are described by the package README. Do not
 ## Contribution expectations
 
 Add focused regression coverage for behavior changes. Update the README and relevant guide when a contract, configuration option, security property, lifecycle rule, or operational assumption changes. Report the exact versions and services exercised; local checks do not imply hosted CI or release validation.
+
+The current local quality matrix passes on CPython 3.11, 3.12, 3.13, and 3.14: all 6 tests, Ruff
+lint and format checks, strict mypy, and wheel/sdist builds pass on each interpreter. The suite uses
+fake NATS clients; no JetStream server, stream retention/replica policy, credentials, or hosted CI was
+exercised.

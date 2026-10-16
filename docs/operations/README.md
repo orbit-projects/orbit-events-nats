@@ -54,22 +54,35 @@ await transport.publish(order_created_event)
 ```
 
 The plugin registers the adapter under `NATS_EVENT_TRANSPORT_KEY` and drains/closes the client at
-Core shutdown. Concurrent shutdown callers share one drain operation, and cancellation is propagated
-only after owned cleanup finishes. The JetStream publisher waits for the server's publish
-acknowledgement. Consumers use
+Core shutdown. Concurrent shutdown callers share one drain operation. Successfully released
+subscriptions and connections are removed from local ownership; failed or interrupted cleanup
+remains available for a later `close()` retry while the transport stays unavailable. A cancelled
+caller waits for its shared cleanup before cancellation is re-raised. The JetStream publisher waits
+for the server's publish acknowledgement. Consumers use
 durable explicit-ack push subscriptions; queue-group members share work for each event name.
 
 ## Delivery behavior and limits
+
+Published messages use CloudEvents 1.0 structured JSON and include the
+`application/cloudevents+json` content type. Consumers accept both CloudEvents and the prior Orbit
+JSON envelope during migration. The shared `orbit-events` codec bounds message bytes and rejects
+duplicate JSON keys and unsupported CloudEvents versions.
 
 Subjects map to `<subject_prefix>.<event_name>`. Each event subscription gets a durable consumer
 named from `durable_prefix` and the event name. A handler success is acknowledged synchronously; a
 handler failure is negatively acknowledged with bounded redelivery delay until the configured
 `max_deliver`, after which the message is terminated and the subscription ID is reported in
-`failed_subscriptions`. Terminated messages are not automatically copied to a dead-letter stream.
-JetStream stream retention, replication, storage, consumer policies, and server authentication are
-operator-owned. Delivery is at-least-once; handlers should be idempotent. Publish message IDs use the
-Core event ID, but duplicate suppression depends on JetStream's configured duplicate window and is
-not an exactly-once claim.
+`failed_subscriptions`. Dead-lettering is opt-in. Before setting
+`NatsConfig(dead_letter_enabled=True)`, configure the JetStream stream to capture
+`<subject_prefix>.dead-letter.>` (or the broader `<subject_prefix>.>`). Ensure the service identity
+can publish to that subject. The adapter waits for the DLQ publish acknowledgement before
+terminating the source; if publishing fails, it NAKs the source. Invalid payload bytes are preserved
+as-is.
+
+DLQ streams keep the original payload and may contain credentials or personal data. Apply least
+privilege, explicit retention, encryption, replication, and monitoring. Deduplication relies on
+JetStream's configured duplicate window and does not make handling exactly-once. No live NATS server
+test is claimed; the unit tests use fake client objects.
 
 No live NATS server test is claimed; the unit tests use fake client objects.
 
