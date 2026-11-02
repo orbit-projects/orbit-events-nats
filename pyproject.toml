@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<2"]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.8,<1", "mypy>=1.13,<3"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orbit_events_nats"]
